@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -19,6 +20,8 @@ import (
 )
 
 // config options
+var sclient *client
+
 var (
 	userOption = &option{
 		Name:    "user",
@@ -111,28 +114,63 @@ type client struct {
 	handle *ssh.Client
 }
 
-func (c *client) executeCommand(cmd string) (string, error) {
+func (c *client) user() string {
+	return c.handle.Conn.User()
+}
+
+func (c *client) addr() string {
+	return c.handle.Conn.RemoteAddr().String()
+}
+
+func (c *client) doesUserExist(name string) bool {
+	cmd := fmt.Sprintf("echo $(id -u %s > /dev/null 2>&1; echo $?)", name)
+	return !c.executeCommandBool(cmd)
+}
+
+func (c *client) createUser(name, password string) {
+	cmd := fmt.Sprintf(
+		`useradd %[1]s && \
+		echo %[1]s:%[2]s | chpasswd && \
+		sudo mkdir /home/%[1]s && \
+		sudo chown %[1]s:%[1]s /home/%[1]s`, name, password)
+	_ = c.executeCommand(cmd)
+}
+
+func (c *client) logExecutionError(cmd string, err error) {
+	log.Fatalf("Error executing command `%s` on %s@%s: %s\n", cmd, c.user(), c.addr(), err.Error())
+}
+
+func (c *client) executeCommand(cmd string) string {
 	sess, err := c.handle.NewSession()
 	if err != nil {
-		return "", err
+		c.logExecutionError(cmd, err)
 	}
 	defer sess.Close()
 
-	var stdoutBuf bytes.Buffer
+	var (
+		stdoutBuf bytes.Buffer
+		stderrBuf bytes.Buffer
+	)
+
 	sess.Stdout = &stdoutBuf
+	sess.Stderr = &stderrBuf
 	sess.Run(cmd)
 
-	return stdoutBuf.String(), nil
-}
+	fmt.Printf("stdout => %s\nstderr => %s\n", stdoutBuf.String(), stderrBuf.String())
 
-func (c *client) executeCommandBool(cmd string) (bool, error) {
-	res, err := c.executeCommand(cmd)
+	err = wrapStderr(stderrBuf)
 	if err != nil {
-		return false, err
+		c.logExecutionError(cmd, err)
 	}
 
-	bres, _ := strconv.ParseBool(res)
-	return bres, nil
+	return stdoutBuf.String()
+}
+
+func (c *client) executeCommandBool(cmd string) bool {
+	res := c.executeCommand(cmd)
+
+	bres, _ := strconv.ParseBool(strings.TrimSpace(res))
+	return bres
 }
 
 func resolveOptions() {
@@ -153,17 +191,6 @@ func resolveOptions() {
 	for _, opt := range opts {
 		opt.Validate()
 	}
-}
-
-func getHomeDir() string {
-	if runtime.GOOS == "windows" {
-		home := os.Getenv("HOMEDRIVE") + os.Getenv("HOMEPATH")
-		if home == "" {
-			home = os.Getenv("USERPROFILE")
-		}
-		return home
-	}
-	return os.Getenv("HOME")
 }
 
 func promptYesOrNo(msg string) bool {
@@ -201,6 +228,35 @@ func readPassword() string {
 	return string(bPass)
 }
 
+func readNewPassword() string {
+	var newPassword string
+	for {
+		fmt.Printf("enter password for new user %s@%s: ", newUserOption.Value, hostOption.Value)
+		bNewPassword, err := terminal.ReadPassword(int(syscall.Stdin))
+		fmt.Println()
+		if err != nil {
+			fmt.Print("could not read password\n\n")
+			continue
+		}
+		newPassword = string(bNewPassword)
+
+		fmt.Printf("confirm password for new user %s@%s: ", newUserOption.Value, hostOption.Value)
+		confirmed, err := terminal.ReadPassword(int(syscall.Stdin))
+		fmt.Println()
+		if err != nil {
+			fmt.Print("could not read password\n\n")
+			continue
+		}
+
+		if string(confirmed) != newPassword {
+			fmt.Print("passwords did not match\n\n")
+			continue
+		}
+
+		return newPassword
+	}
+}
+
 func dial() *client {
 	pw := readPassword()
 	sshConf := &ssh.ClientConfig{
@@ -209,12 +265,10 @@ func dial() *client {
 			ssh.Password(pw),
 		},
 		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			fmt.Printf("\nSuccessfully connected to %s\n\n", hostname)
 			return nil
 		},
 	}
-	fmt.Println(hostOption.Value, portOption.Value)
-	host := fmt.Sprintf("%s:22", hostOption.Value)
+	host := fmt.Sprintf("%s:%s", hostOption.Value, portOption.Value)
 
 	conn, err := ssh.Dial("tcp", host, sshConf)
 	if err != nil {
@@ -222,6 +276,25 @@ func dial() *client {
 	}
 
 	return &client{conn}
+}
+
+func wrapStderr(stderr bytes.Buffer) error {
+	str := stderr.String()
+	if len(str) != 0 {
+		return errors.New(str)
+	}
+	return nil
+}
+
+func getHomeDir() string {
+	if runtime.GOOS == "windows" {
+		home := os.Getenv("HOMEDRIVE") + os.Getenv("HOMEPATH")
+		if home == "" {
+			home = os.Getenv("USERPROFILE")
+		}
+		return home
+	}
+	return os.Getenv("HOME")
 }
 
 func getSSHDir() string {
@@ -269,13 +342,25 @@ func init() {
 	resolveOptions()
 }
 
-func main() {
-	client := dial()
-	res, err := client.executeCommand("lkkks")
-	if err != nil {
-		log.Fatal(err.Error())
-	}
+func createNewUserIfNeeded() {
+	if !newUserOption.IsNil() {
+		uname := newUserOption.Value
+		if sclient.doesUserExist(uname) {
+			log.Fatalf("user `%s@%s` already exists\n", uname, sclient.addr())
+		}
+		pw := readNewPassword()
 
-	fmt.Println(res)
+		sclient.createUser(uname, pw)
+	}
+}
+
+func main() {
+	sclient = dial()
+	fmt.Printf("successfully authenticated as %s@%s\n", sclient.user(), sclient.addr())
+
+	createNewUserIfNeeded()
+
+	// res := sclient.executeCommand("ls")
+	// fmt.Println(res)
 	fmt.Println(getSSHKeys())
 }
