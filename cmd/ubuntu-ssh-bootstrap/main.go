@@ -3,6 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/asn1"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,14 +19,15 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
-// config options
 var sclient *client
 
+// config options
 var (
 	userOption = &option{
 		Name:    "user",
@@ -47,6 +53,33 @@ var (
 		Usage:   "Configure server to only except ssh authentication",
 		Default: false,
 	}
+	disableRootLoginOption = &optionBool{
+		Name:    "no-root",
+		Usage:   "Disable logging in as `root` via SSH",
+		Default: false,
+	}
+	sshKeySizeOption = &optionInt{
+		Name:    "key-size",
+		Usage:   "Bit size for RSA SSH key to generate",
+		Default: 4096,
+		Validators: []optionIntValidator{
+			func(n int) error {
+				if n < 0 {
+					return errors.New("`key-size` must be a positive integer")
+				}
+				return nil
+			},
+		},
+	}
+)
+
+// ssh files/paths
+const (
+	sshConfigDir          = "/etc/ssh"
+	sshConfigFile         = "/etc/ssh/sshd_config"
+	sshDir                = "~/.ssh"
+	sshIDRSAFile          = "~/.ssh/id_rsa"
+	sshAuthorizedKeysFile = "~/.ssh/authorized_keys"
 )
 
 type configOpt interface {
@@ -56,6 +89,7 @@ type configOpt interface {
 
 type stringValidator func(string) error
 type optionValidator func(string) error
+type optionIntValidator func(int) error
 type optionBoolValidator func(bool) error
 
 type option struct {
@@ -110,6 +144,82 @@ func (opt *optionBool) Validate() {
 	}
 }
 
+type optionInt struct {
+	Name       string
+	Usage      string
+	Default    int
+	Required   bool
+	Value      int
+	Validators []optionIntValidator
+}
+
+func (opt *optionInt) Resolve() {
+	flag.IntVar(&opt.Value, opt.Name, opt.Default, opt.Usage)
+}
+
+func (opt *optionInt) Validate() {
+	for _, validator := range opt.Validators {
+		err := validator(opt.Value)
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+	}
+}
+
+type privateKey struct {
+	*rsa.PrivateKey
+}
+
+func (pk *privateKey) writeToFile(path string) {
+	outf, err := os.Create(path)
+	if err != nil {
+		log.Fatalf("could create file `%s` for private key: %s \n", path, err.Error())
+	}
+	defer outf.Close()
+
+	key := &pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(pk.PrivateKey),
+	}
+
+	err = pem.Encode(outf, key)
+	if err != nil {
+		log.Fatalf("could not encode private key to file `%s`: %s\n", path, err.Error())
+	}
+
+	fmt.Printf("private key has been saved to: `%s`\n", path)
+}
+
+func (pk *privateKey) writePublicKeyToFile(path string) {
+	outf, err := os.Create(path + ".pub")
+	if err != nil {
+		log.Fatalf("could create file `%s.pub` for public key: %s \n", path, err.Error())
+	}
+	defer outf.Close()
+
+	asn1Bytes, err := asn1.Marshal(pk.PublicKey)
+	if err != nil {
+		log.Fatalln("could not marshall puk", err.Error())
+	}
+
+	key := &pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: asn1Bytes,
+	}
+
+	err = pem.Encode(outf, key)
+	if err != nil {
+		log.Fatalf("could not encode public key to file `%s`: %s\n", path, err.Error())
+	}
+
+	fmt.Printf("public key has been saved to: `%s`\n", path)
+}
+
+func (pk *privateKey) writeKeyPairToFiles(basename string) {
+	pk.writeToFile(basename)
+	pk.writePublicKeyToFile(basename)
+}
+
 type client struct {
 	handle *ssh.Client
 }
@@ -120,6 +230,69 @@ func (c *client) user() string {
 
 func (c *client) addr() string {
 	return c.handle.Conn.RemoteAddr().String()
+}
+
+func (c *client) doesFileExist(path string) bool {
+	cmd := fmt.Sprintf("echo $([ -f %s ] && echo 1 : echo 0)", path)
+	return c.executeCommandBool(cmd)
+}
+
+func (c *client) doesDirExist(path string) bool {
+	cmd := fmt.Sprintf("echo $([ -d %s ] && echo 1 : echo 0)", path)
+	return c.executeCommandBool(cmd)
+}
+
+func (c *client) mkdir(dirs ...string) {
+	dirStr := strings.Join(dirs, " ")
+	cmd := fmt.Sprintf("mkdir %s", dirStr)
+	_ = c.executeCommand(cmd)
+}
+
+func (c *client) touch(files ...string) {
+	fileStr := strings.Join(files, " ")
+	cmd := fmt.Sprintf("touch %s", fileStr)
+	_ = c.executeCommand(cmd)
+}
+
+func (c *client) appendToFile(fname, content string) {
+	if !c.doesFileExist(fname) {
+		log.Fatalf("could not append to file `%s`; no such file exists\n", fname)
+	}
+
+	cmd := fmt.Sprintf("echo \"%s\" >> %s", escapeDoubleQuotedStr(content), fname)
+	_ = c.executeCommand(cmd)
+}
+
+func (c *client) createAuthorizedKeysIfNeeded() {
+	if !c.doesDirExist(sshConfigDir) {
+		c.mkdir(sshConfigDir)
+	}
+
+	if !c.doesFileExist(sshAuthorizedKeysFile) {
+		c.touch(sshAuthorizedKeysFile)
+	}
+}
+
+func (c *client) addAuthorizedKey(pukStr string) {
+	c.appendToFile(sshAuthorizedKeysFile, pukStr)
+}
+
+func (c *client) createSSHConfigIfNeeded() {
+	if !c.doesFileExist(sshConfigFile) {
+		c.touch(sshConfigFile)
+	}
+}
+
+func (c *client) disableSSHPasswordAuth() {
+	ln := wrapConfigLine("PasswordAuthentication no",
+		"because you chose to disable clear-text password authentication over SSH")
+	c.appendToFile(sshConfigFile, ln)
+}
+
+func (c *client) disableSSHRootLogin() {
+	ln := wrapConfigLine("PermitRootLogin no",
+		"because you chose to disable authenticating as `root` user over SSH")
+	c.appendToFile(sshConfigFile, ln)
 }
 
 func (c *client) doesUserExist(name string) bool {
@@ -278,6 +451,25 @@ func dial() *client {
 	return &client{conn}
 }
 
+func wrapConfigLine(line string, notes ...string) string {
+	for i, str := range notes {
+		if i == 0 {
+			str = "\n" + str
+		}
+		notes[i] = strings.Replace(str, "\n", "\n### ", -1)
+	}
+	noteStr := strings.Join(notes, "\n### ")
+	now := time.Now()
+	nowStr := now.Format("2020-09-23 15:42:00")
+
+	return fmt.Sprintf("### start: generated on %s by ubuntu-secure-bootstrap%s ###\n%s\n### end ###\n",
+		nowStr, noteStr, line)
+}
+
+func escapeDoubleQuotedStr(str string) string {
+	return strings.Replace(str, "\"", "\\\"", -1)
+}
+
 func wrapStderr(stderr bytes.Buffer) error {
 	str := stderr.String()
 	if len(str) != 0 {
@@ -312,6 +504,20 @@ func doesSSHDirExist() bool {
 
 func makeSSHDir() {
 	os.MkdirAll(getSSHDir(), os.ModePerm)
+}
+
+func generatePrivateKey(bitSize int) (*privateKey, error) {
+	prk, err := rsa.GenerateKey(rand.Reader, bitSize)
+	if err != nil {
+		return nil, err
+	}
+
+	err = prk.Validate()
+	if err != nil {
+		return nil, err
+	}
+
+	return &privateKey{prk}, nil
 }
 
 func createSSHKeyPair(name string) {
@@ -354,13 +560,57 @@ func createNewUserIfNeeded() {
 	}
 }
 
+func authorizeHost(pukStr string) {
+	sclient.createAuthorizedKeysIfNeeded()
+	sclient.addAuthorizedKey(pukStr)
+}
+
+func forceSSHAuthIfNeeded() {
+	if sshOnlyOption.Value {
+		sclient.createSSHConfigIfNeeded()
+		sclient.disableSSHPasswordAuth()
+	}
+}
+
+func disableSSHRootLoginIfNeeded() {
+	if disableRootLoginOption.Value {
+		sclient.createSSHConfigIfNeeded()
+		sclient.disableSSHRootLogin()
+	}
+}
+
 func main() {
+	// r := bufio.NewReader(os.Stdin)
+	// name, err := r.ReadString('\n')
+	// if err != nil {
+	// 	log.Fatalln("Error reading name from stdin", err.Error())
+	// }
+
+	// puk, err := generatePrivateKey(4096)
+	// if err != nil {
+	// 	log.Fatalln("Error generating private key", err.Error())
+	// }
+	// puk.writeKeyPairToFiles(strings.TrimSpace(name))
+
 	sclient = dial()
 	fmt.Printf("successfully authenticated as %s@%s\n", sclient.user(), sclient.addr())
-
 	createNewUserIfNeeded()
+	forceSSHAuthIfNeeded()
+	disableSSHRootLoginIfNeeded()
 
 	// res := sclient.executeCommand("ls")
 	// fmt.Println(res)
 	fmt.Println(getSSHKeys())
 }
+
+// connect to remote server
+// create new user if needed
+// obtain a public ssh key
+// check if user has ssh keys
+// if no ssh keys, prompt user to create one `id_rsa` by default or via user input
+// add ssh key to authorized on server
+// create ssh folder in homedir if needed
+// make .ssh/authorized_keys if needed
+// copy public key buffer to file if not currently present
+// edit /etc/ssh/sshd_config to only allow puk authorization for ssh connections if needed
+// read summary back to user
