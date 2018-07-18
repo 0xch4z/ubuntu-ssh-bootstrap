@@ -51,7 +51,7 @@ var (
 	sshOnlyOption = &optionBool{
 		Name:    "ssh-only",
 		Usage:   "Configure server to only except ssh authentication",
-		Default: false,
+		Default: true,
 	}
 	disableRootLoginOption = &optionBool{
 		Name:    "no-root",
@@ -233,12 +233,12 @@ func (c *client) addr() string {
 }
 
 func (c *client) doesFileExist(path string) bool {
-	cmd := fmt.Sprintf("echo $([ -f %s ] && echo 1 : echo 0)", path)
+	cmd := fmt.Sprintf("echo $([ -f %s ] && echo 1 || echo 0)", path)
 	return c.executeCommandBool(cmd)
 }
 
 func (c *client) doesDirExist(path string) bool {
-	cmd := fmt.Sprintf("echo $([ -d %s ] && echo 1 : echo 0)", path)
+	cmd := fmt.Sprintf("echo $([ -d %s ] && echo 1 || echo 0)", path)
 	return c.executeCommandBool(cmd)
 }
 
@@ -264,8 +264,8 @@ func (c *client) appendToFile(fname, content string) {
 }
 
 func (c *client) createAuthorizedKeysIfNeeded() {
-	if !c.doesDirExist(sshConfigDir) {
-		c.mkdir(sshConfigDir)
+	if !c.doesDirExist(sshDir) {
+		c.mkdir(sshDir)
 	}
 
 	if !c.doesFileExist(sshAuthorizedKeysFile) {
@@ -302,10 +302,11 @@ func (c *client) doesUserExist(name string) bool {
 
 func (c *client) createUser(name, password string) {
 	cmd := fmt.Sprintf(
-		`useradd %[1]s && \
+		`useradd %[1]s --system && \
 		echo %[1]s:%[2]s | chpasswd && \
 		sudo mkdir /home/%[1]s && \
-		sudo chown %[1]s:%[1]s /home/%[1]s`, name, password)
+		sudo chown %[1]s:%[1]s /home/%[1]s && \
+		su %[1]s`, name, password)
 	_ = c.executeCommand(cmd)
 }
 
@@ -329,8 +330,6 @@ func (c *client) executeCommand(cmd string) string {
 	sess.Stderr = &stderrBuf
 	sess.Run(cmd)
 
-	fmt.Printf("stdout => %s\nstderr => %s\n", stdoutBuf.String(), stderrBuf.String())
-
 	err = wrapStderr(stderrBuf)
 	if err != nil {
 		c.logExecutionError(cmd, err)
@@ -346,6 +345,18 @@ func (c *client) executeCommandBool(cmd string) bool {
 	return bres
 }
 
+func (c *client) changeUser(uname string) {
+	if !c.doesUserExist(uname) {
+		log.Fatalf("cannot change to user `%s`; no such user\n", uname)
+	}
+
+	_ = c.executeCommand("su " + uname)
+}
+
+func (c *client) restartSSH() {
+	_ = c.executeCommand("service ssh")
+}
+
 func resolveOptions() {
 	opts := []configOpt{
 		userOption,
@@ -353,6 +364,8 @@ func resolveOptions() {
 		hostOption,
 		portOption,
 		sshOnlyOption,
+		disableRootLoginOption,
+		sshKeySizeOption,
 	}
 
 	for _, opt := range opts {
@@ -364,6 +377,12 @@ func resolveOptions() {
 	for _, opt := range opts {
 		opt.Validate()
 	}
+}
+
+func prompt(msg string) string {
+	reader := bufio.NewReader(os.Stdin)
+	res, _ := reader.ReadString('\n')
+	return res
 }
 
 func promptYesOrNo(msg string) bool {
@@ -460,7 +479,7 @@ func wrapConfigLine(line string, notes ...string) string {
 	}
 	noteStr := strings.Join(notes, "\n### ")
 	now := time.Now()
-	nowStr := now.Format("2020-09-23 15:42:00")
+	nowStr := now.Format("2006-01-02 15:04:05")
 
 	return fmt.Sprintf("### start: generated on %s by ubuntu-secure-bootstrap%s ###\n%s\n### end ###\n",
 		nowStr, noteStr, line)
@@ -520,14 +539,6 @@ func generatePrivateKey(bitSize int) (*privateKey, error) {
 	return &privateKey{prk}, nil
 }
 
-func createSSHKeyPair(name string) {
-	sshDir := getSSHDir()
-
-	if _, err := os.Stat(sshDir + name); err == nil {
-		fmt.Println("")
-	}
-}
-
 func getSSHKeys() []string {
 	sshDir := getSSHDir()
 
@@ -544,10 +555,6 @@ func getSSHKeys() []string {
 	return fnames
 }
 
-func init() {
-	resolveOptions()
-}
-
 func createNewUserIfNeeded() {
 	if !newUserOption.IsNil() {
 		uname := newUserOption.Value
@@ -557,6 +564,7 @@ func createNewUserIfNeeded() {
 		pw := readNewPassword()
 
 		sclient.createUser(uname, pw)
+		sclient.changeUser(uname)
 	}
 }
 
@@ -579,38 +587,58 @@ func disableSSHRootLoginIfNeeded() {
 	}
 }
 
-func main() {
-	// r := bufio.NewReader(os.Stdin)
-	// name, err := r.ReadString('\n')
-	// if err != nil {
-	// 	log.Fatalln("Error reading name from stdin", err.Error())
-	// }
+func getPublicSSHKey() string {
+	var fname string
 
-	// puk, err := generatePrivateKey(4096)
-	// if err != nil {
-	// 	log.Fatalln("Error generating private key", err.Error())
-	// }
-	// puk.writeKeyPairToFiles(strings.TrimSpace(name))
+	if !doesSSHDirExist() {
+		makeSSHDir()
+	}
 
-	sclient = dial()
-	fmt.Printf("successfully authenticated as %s@%s\n", sclient.user(), sclient.addr())
-	createNewUserIfNeeded()
-	forceSSHAuthIfNeeded()
-	disableSSHRootLoginIfNeeded()
+	hasIDRSAKey := false
+	sshDir := getSSHDir()
+	keys := getSSHKeys()
+	for _, key := range keys {
+		if key == "id_rsa.pub" {
+			hasIDRSAKey = true
+		}
+	}
 
-	// res := sclient.executeCommand("ls")
-	// fmt.Println(res)
-	fmt.Println(getSSHKeys())
+	if hasIDRSAKey {
+		fname = "id_rsa.pub"
+	} else {
+		res := promptYesOrNo("Could not find an `id_rsa` SSH key, want me to generate an SSH key?")
+		if res {
+			name := prompt("SSH key name")
+			priv, err := generatePrivateKey(sshKeySizeOption.Value)
+			if err != nil {
+				log.Fatalln("Could not generate private key:", err.Error())
+			}
+
+			priv.writeKeyPairToFiles(name)
+			fname = name + ".pub"
+		}
+	}
+
+	fpath := fmt.Sprintf("%s/%s", sshDir, fname)
+	pukBytes, err := ioutil.ReadFile(fpath)
+	if err != nil {
+		log.Fatalf("could not read public key `%s`: %s\n", fpath, err.Error())
+	}
+	return string(pukBytes)
 }
 
-// connect to remote server
-// create new user if needed
-// obtain a public ssh key
-// check if user has ssh keys
-// if no ssh keys, prompt user to create one `id_rsa` by default or via user input
-// add ssh key to authorized on server
-// create ssh folder in homedir if needed
-// make .ssh/authorized_keys if needed
-// copy public key buffer to file if not currently present
-// edit /etc/ssh/sshd_config to only allow puk authorization for ssh connections if needed
-// read summary back to user
+func init() {
+	resolveOptions()
+}
+
+func main() {
+	sclient = dial()
+	fmt.Printf("successfully authenticated as %s@%s\n", sclient.user(), sclient.addr())
+
+	puk := getPublicSSHKey()
+	forceSSHAuthIfNeeded()
+	disableSSHRootLoginIfNeeded()
+	createNewUserIfNeeded()
+	authorizeHost(puk)
+	sclient.restartSSH()
+}
